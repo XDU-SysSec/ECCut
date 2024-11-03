@@ -36,7 +36,10 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/ScopedPrinter.h"
-
+#include <fstream>
+#include <iostream>
+#include <vector>
+using namespace std;
 using namespace clang;
 using namespace CodeGen;
 
@@ -1717,6 +1720,7 @@ CGCallee ItaniumCXXABI::getVirtualFunctionPointer(CodeGenFunction &CGF,
                                                   Address This,
                                                   llvm::Type *Ty,
                                                   SourceLocation Loc) {
+  std::hash<std::string> hash_fn;
   Ty = Ty->getPointerTo()->getPointerTo();
   auto *MethodDecl = cast<CXXMethodDecl>(GD.getDecl());
   llvm::Value *VTable = CGF.GetVTablePtr(This, Ty, MethodDecl->getParent());
@@ -1747,6 +1751,49 @@ CGCallee ItaniumCXXABI::getVirtualFunctionPointer(CodeGenFunction &CGF,
           llvm::LLVMContext::MD_invariant_load,
           llvm::MDNode::get(CGM.getLLVMContext(),
                             llvm::ArrayRef<llvm::Metadata *>()));
+
+    /*
+     * OS-CFI clang codegen modification to instrument reference monitor for
+     * virtual function indirect call
+     * Beginning of modification
+     */
+    // create an identification for the ICT
+    std::string idCreator;
+    llvm::raw_string_ostream rso(idCreator);
+    Loc.print(rso, CGM.getContext().getSourceManager());
+    unsigned long id = hash_fn(idCreator) % 10000000;
+
+    llvm::Value *id_value = llvm::ConstantInt::get(CGM.IntTy, id, false);
+    llvm::Value *id_value_64 =
+        CGF.Builder.CreateIntCast(id_value, CGM.Int64Ty, false);
+
+    llvm::Value *vTableAddr = CGF.Builder.CreatePtrToInt(VTable, CGM.Int64Ty);
+    llvm::Value *thisPtrAddr =
+        CGF.Builder.CreateBitCast(This.getPointer(), CGM.VoidPtrTy);
+    llvm::Value *thisPtrAddrVal =
+        CGF.Builder.CreatePtrToInt(thisPtrAddr, CGM.Int64Ty);
+
+    llvm::Value *calleePtrVal =
+        CGF.Builder.CreateBitCast(VFuncLoad, CGM.VoidPtrTy);
+    llvm::Value *calleePtrValInt =
+        CGF.Builder.CreatePtrToInt(calleePtrVal, CGM.Int64Ty);
+
+    // prepare to call reference monitor
+    llvm::FunctionType *vreftype = llvm::FunctionType::get(
+        CGM.VoidTy, {CGM.Int64Ty, CGM.Int64Ty, CGM.Int64Ty, CGM.Int64Ty},
+        false);
+    llvm::Constant *rf =
+        CGM.CreateRuntimeFunction(vreftype, "vcall_reference_monitor");
+
+    llvm::CallInst *rfcall = CGF.Builder.CreateCall(
+        rf, {id_value_64, thisPtrAddrVal, vTableAddr, calleePtrValInt});
+    rfcall->setTailCallKind(llvm::CallInst::TailCallKind::TCK_NoTail);
+    /*
+     * OS-CFI clang codegen modification to instrument reference monitor for
+     * virtual function indirect call
+     * Ending of modification
+     */
+
     VFunc = VFuncLoad;
   }
 
